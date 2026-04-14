@@ -10,7 +10,7 @@ export interface PluginConfig {
 }
 
 export const defaults: PluginConfig = {
-  kipUrl: 'http://localhost:3000',
+  kipUrl: 'http://192.168.0.148:3000/@signalk/app-dock/',
   display: ':99',
   resolution: '1024x600x24',
   streamPort: 5004,
