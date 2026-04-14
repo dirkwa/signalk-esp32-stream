@@ -62,16 +62,20 @@ def main():
     # Start ffmpeg
     cmd = [
         'ffmpeg',
+        '-probesize', '32',          # minimize startup delay
+        '-fflags', 'nobuffer',       # no input buffering
         '-f', 'x11grab',
-        '-r', str(FPS),
+        '-framerate', str(FPS),
         '-s', RESOLUTION,
+        '-draw_mouse', '0',          # hide mouse cursor
         '-i', DISPLAY,
-        '-pix_fmt', 'yuvj420p',     # YUV 4:2:0 — required by ESP32-P4 HW JPEG decoder
+        '-pix_fmt', 'yuvj420p',      # YUV 4:2:0 — required by ESP32-P4 HW JPEG decoder
         '-vcodec', 'mjpeg',
         '-q:v', str(QUALITY),
-        '-huffman', 'default',       # baseline Huffman (not optimized/progressive)
+        '-huffman', 'default',        # baseline (not progressive)
         '-f', 'image2pipe',
         '-an',
+        '-flush_packets', '1',       # flush each frame immediately
         'pipe:1',
     ]
     print(f"Starting ffmpeg: {' '.join(cmd)}", flush=True)
