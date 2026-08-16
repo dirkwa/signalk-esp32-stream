@@ -1,6 +1,6 @@
 {
   "name": "signalk-esp32-stream",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Stream KIP dashboard to ESP32-P4 display via MJPEG over TCP",
   "main": "dist/index.js",
   "scripts": {
@@ -15,8 +15,13 @@
     "mjpeg"
   ],
   "signalk-plugin-enabled-by-default": false,
-  "author": "",
-  "license": "MIT",
+  "author": "Dirk Wahrheit",
+  "license": "SEE LICENSE IN LICENSE.md",
+  "files": [
+    "dist/**/*",
+    "LICENSE.md",
+    "README.md"
+  ],
   "dependencies": {
     "@signalk/server-api": "*"
   },
