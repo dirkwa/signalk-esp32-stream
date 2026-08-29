@@ -38,10 +38,13 @@ JPEG_EOI = b"\xff\xd9"
 
 
 class LatestFrame:
+    """1-deep slot. close() marks the producer dead so consumers unblock."""
+
     def __init__(self):
         self._cond = threading.Condition()
         self._jpeg = None
         self._seq = 0
+        self.closed = False
 
     def publish(self, jpeg: bytes):
         with self._cond:
@@ -49,10 +52,20 @@ class LatestFrame:
             self._seq += 1
             self._cond.notify_all()
 
-    def take_newer_than(self, seq: int):
+    def close(self):
         with self._cond:
-            while self._seq <= seq:
+            self.closed = True
+            self._cond.notify_all()
+
+    def take_newer_than(self, seq: int):
+        """Newest (jpeg, seq), or (None, seq) once the producer is gone —
+        without this a client would block in wait() forever (the socket
+        ACK timeout does not cover a Condition wait)."""
+        with self._cond:
+            while self._seq <= seq and not self.closed:
                 self._cond.wait()
+            if self._seq <= seq:
+                return None, seq
             return self._jpeg, self._seq
 
 
@@ -85,6 +98,7 @@ def start_chromium(display: str, url: str):
 def start_ffmpeg(display: str, fps: int, quality: int):
     cmd = [
         "ffmpeg",
+        "-loglevel", "error",  # quiet, but capture-chain failures stay visible
         "-probesize", "32",
         "-fflags", "nobuffer",
         "-f", "x11grab",
@@ -101,7 +115,7 @@ def start_ffmpeg(display: str, fps: int, quality: int):
         "-flush_packets", "1",
         "pipe:1",
     ]
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE)  # stderr inherited
 
 
 def frame_reader(ffmpeg, slot: LatestFrame):
@@ -119,7 +133,9 @@ def frame_reader(ffmpeg, slot: LatestFrame):
         while True:
             soi = buf.find(JPEG_SOI)
             if soi < 0:
-                buf = b""
+                # A chunk may end mid-marker: keep a trailing 0xFF, it can be
+                # the first byte of the next SOI.
+                buf = buf[-1:] if buf.endswith(b"\xff") else b""
                 break
             if soi > 0:
                 buf = buf[soi:]
@@ -128,7 +144,16 @@ def frame_reader(ffmpeg, slot: LatestFrame):
                 break
             slot.publish(buf[:eoi + 2])
             buf = buf[eoi + 2:]
-    print("ffmpeg stream ended", flush=True)
+    print("capture chain ended (ffmpeg stdout closed)", flush=True)
+    slot.close()  # unblock any client waiting on the next frame
+
+
+# IP of the currently-connected stream client; touch packets from anyone
+# else are dropped. XTEST drives the kiosk UI, so an open UDP port would
+# hand control of the plotter to any host on the network — tying it to the
+# active stream connection needs no configuration and no shared secret.
+allowed_touch_ip = None
+allowed_touch_lock = threading.Lock()
 
 
 def touch_injector(display_str: str, port: int):
@@ -140,9 +165,14 @@ def touch_injector(display_str: str, port: int):
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind(("0.0.0.0", port))
-    print(f"touch injector on UDP {port} -> {display_str}", flush=True)
+    print(f"touch injector on UDP {port} -> {display_str} "
+          f"(stream client only)", flush=True)
     while True:
-        data, _ = s.recvfrom(64)
+        data, src = s.recvfrom(64)
+        with allowed_touch_lock:
+            allowed = allowed_touch_ip
+        if allowed is None or src[0] != allowed:
+            continue
         if len(data) < 5:
             continue
         x, y = struct.unpack("<HH", data[:4])
@@ -158,9 +188,12 @@ def touch_injector(display_str: str, port: int):
 
 
 def handle_client(conn: socket.socket, addr, slot: LatestFrame):
+    global allowed_touch_ip
     print(f"client connected: {addr}", flush=True)
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     conn.settimeout(ACK_TIMEOUT_S)
+    with allowed_touch_lock:
+        allowed_touch_ip = addr[0]
     sent = 0
     sent_bytes = 0
     seq = 0
@@ -169,6 +202,9 @@ def handle_client(conn: socket.socket, addr, slot: LatestFrame):
     try:
         while True:
             jpeg, seq = slot.take_newer_than(seq)
+            if jpeg is None:
+                print(f"client {addr}: capture chain gone, dropping", flush=True)
+                return
             conn.sendall(struct.pack(">I", len(jpeg)) + jpeg)
             sent += 1
             sent_bytes += len(jpeg) + 4
@@ -187,6 +223,8 @@ def handle_client(conn: socket.socket, addr, slot: LatestFrame):
     except (BrokenPipeError, ConnectionResetError, OSError) as e:
         print(f"client {addr} disconnected after {sent} frames: {e}", flush=True)
     finally:
+        with allowed_touch_lock:
+            allowed_touch_ip = None
         conn.close()
 
 
@@ -199,6 +237,10 @@ def main():
     ap.add_argument("--quality", type=int, default=6)
     ap.add_argument("--display", default=":99")
     args = ap.parse_args()
+    if args.fps < 1:
+        ap.error("--fps must be >= 1")
+    if not 2 <= args.quality <= 31:
+        ap.error("--quality must be 2..31 (ffmpeg -q:v, lower is better)")
 
     children = []
     try:
@@ -222,15 +264,25 @@ def main():
         server.bind(("0.0.0.0", args.port))
         server.listen(1)
         print(f"ACK-paced MJPEG on TCP {args.port}", flush=True)
-        while True:
+        while not slot.closed:
             conn, addr = server.accept()
             handle_client(conn, addr, slot)
+        # Dead capture chain: exit non-zero so a supervisor restarts the
+        # whole stack instead of the server sitting there looking healthy.
+        print("exiting: capture chain is dead", flush=True)
+        sys.exit(1)
     except KeyboardInterrupt:
         print("\nshutting down", flush=True)
     finally:
-        for p in children:
+        # terminate() alone can leave Xvfb holding /tmp/.X<n>-lock, which
+        # makes the next start_xvfb() adopt a display it never owned.
+        for p in reversed(children):
             try:
                 p.terminate()
+                p.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait(timeout=3)
             except Exception:
                 pass
 

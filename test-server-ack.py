@@ -38,12 +38,14 @@ ACK_TIMEOUT_S = 30.0
 
 
 class LatestFrame:
-    """1-deep slot: producer overwrites, consumer takes the newest."""
+    """1-deep slot: producer overwrites, consumer takes the newest.
+    close() marks the producer dead so waiting consumers unblock."""
 
     def __init__(self):
         self._cond = threading.Condition()
         self._jpeg = None
         self._seq = 0
+        self.closed = False
 
     def publish(self, jpeg: bytes):
         with self._cond:
@@ -51,10 +53,20 @@ class LatestFrame:
             self._seq += 1
             self._cond.notify_all()
 
-    def take_newer_than(self, seq: int):
+    def close(self):
         with self._cond:
-            while self._seq <= seq:
+            self.closed = True
+            self._cond.notify_all()
+
+    def take_newer_than(self, seq: int):
+        """Newest (jpeg, seq), or (None, seq) once the producer is gone —
+        the socket ACK timeout does not cover a Condition wait, so without
+        this a client would block forever."""
+        with self._cond:
+            while self._seq <= seq and not self.closed:
                 self._cond.wait()
+            if self._seq <= seq:
+                return None, seq
             return self._jpeg, self._seq
 
 
@@ -101,15 +113,22 @@ def generate_frame(n: int, quality: int) -> bytes:
 
 
 def producer(slot: LatestFrame, fps: int, quality: int):
-    n = 0
-    interval = 1.0 / fps
-    while True:
-        t0 = time.monotonic()
-        slot.publish(generate_frame(n, quality))
-        n += 1
-        remaining = interval - (time.monotonic() - t0)
-        if remaining > 0:
-            time.sleep(remaining)
+    try:
+        n = 0
+        interval = 1.0 / fps
+        while True:
+            t0 = time.monotonic()
+            slot.publish(generate_frame(n, quality))
+            n += 1
+            remaining = interval - (time.monotonic() - t0)
+            if remaining > 0:
+                time.sleep(remaining)
+    except Exception:
+        # A silently-dead daemon thread looks like a healthy server with a
+        # frozen client; make the failure loud and unblock consumers.
+        import traceback
+        traceback.print_exc()
+        slot.close()
 
 
 def handle_client(conn: socket.socket, addr, slot: LatestFrame):
@@ -127,6 +146,9 @@ def handle_client(conn: socket.socket, addr, slot: LatestFrame):
     try:
         while True:
             jpeg, seq = slot.take_newer_than(seq)
+            if jpeg is None:
+                print(f"client {addr}: producer gone, dropping", flush=True)
+                return
             conn.sendall(struct.pack(">I", len(jpeg)) + jpeg)
             sent += 1
             sent_bytes += len(jpeg) + 4
@@ -162,6 +184,10 @@ def main():
                     help="producer rate ceiling; delivery is ACK-paced")
     ap.add_argument("--quality", type=int, default=60)
     args = ap.parse_args()
+    if args.fps < 1:
+        ap.error("--fps must be >= 1")
+    if not 1 <= args.quality <= 95:
+        ap.error("--quality must be 1..95")
 
     slot = LatestFrame()
     threading.Thread(target=producer, args=(slot, args.fps, args.quality),
