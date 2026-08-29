@@ -264,8 +264,15 @@ def main():
         server.bind(("0.0.0.0", args.port))
         server.listen(1)
         print(f"ACK-paced MJPEG on TCP {args.port}", flush=True)
+        # Timed accept so a capture-chain death is noticed even while no
+        # client is connected — a blocking accept() would defer the exit
+        # (and the supervisor restart) until the next connection attempt.
+        server.settimeout(1.0)
         while not slot.closed:
-            conn, addr = server.accept()
+            try:
+                conn, addr = server.accept()
+            except socket.timeout:
+                continue
             handle_client(conn, addr, slot)
         # Dead capture chain: exit non-zero so a supervisor restarts the
         # whole stack instead of the server sitting there looking healthy.
