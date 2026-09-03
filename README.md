@@ -1,5 +1,15 @@
 # signalk-esp32-stream
 
+> **Superseded.** This project continues as
+> [signalk-espos-stream](https://github.com/dirkwa/signalk-espos-stream),
+> where the capture chain (Xvfb + Chromium + ffmpeg + the ACK-paced
+> MJPEG/touch server that started life here as `capture-server-ack.py`)
+> runs as a container managed by a Signal K plugin instead of host-installed
+> processes under systemd. This repository is archived; nothing here is
+> maintained. Note the parts of this README below describe the abandoned
+> v1 TypeScript design — `capture-server-ack.py` (protocol v2) was the
+> last working state.
+
 Signal K plugin that streams a browser-rendered dashboard to an ESP32-P4
 display as MJPEG over TCP, and feeds touch events back the other way.
 
